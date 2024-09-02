@@ -1,0 +1,146 @@
+import functions_framework
+
+
+@functions_framework.http
+def hello_http(request):
+    import pandas as pd
+    import vertexai
+    import time
+    import tqdm
+    import sys
+    from typing import Optional, Sequence
+    from google.cloud import storage
+    from google.api_core.client_options import ClientOptions
+    from google.cloud import documentai
+    from vertexai.preview.language_models import TextEmbeddingModel
+    """HTTP Cloud Function.
+    Args:
+        request (flask.Request): The request object.
+        <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
+    Returns:
+        The response text, or any set of values that can be turned into a
+        Response object using `make_response`
+        <https://flask.palletsprojects.com/en/1.1.x/api/#flask.make_response>.
+    """
+    request_json = request.get_json(silent=True)
+    request_args = request.args
+    
+
+
+    project_id = "solar-theory-417319"
+    location = "us" # Format is "us" or "eu"
+    processor_id = "4d56dde277fee91f" # Create processor before running sample
+    processor_version = "pretrained-ocr-v2.1-2024-08-07" # Refer to https://cloud.google.com/document-ai/docs/manage-processor-versions for more information
+    mime_type = "application/pdf"
+    
+    #try authenticating the user
+    # if "google.colab" in sys.modules:
+    #     from google.colab import auth
+    #     auth.authenticate_user()
+
+
+    file_path = "/test_bucket_pro/2023-annual-report-1-15 (1).pdf" #for now we will hardcode
+    
+    # if request_json and "file_path" in request_json:
+    #     file_path = request_json["file_path"]
+    # elif request_args and "file_path" in request_args:
+    #     file_path = request_args["file_path"]
+    # else:
+    #     #throw error saying file path missing
+    #     return "Error: Missing FilePath"
+
+    process_options = documentai.ProcessOptions(
+        ocr_config=documentai.OcrConfig(
+        enable_native_pdf_parsing=True,
+        enable_image_quality_scores=True,
+        enable_symbol=True,
+        # OCR Add Ons https://cloud.google.com/document-ai/docs/ocr-add-ons
+        premium_features=documentai.OcrConfig.PremiumFeatures(
+            compute_style_info=True,
+            enable_math_ocr=False,  # Enable to use Math OCR Model
+            enable_selection_mark_detection=True,
+        ),
+        )
+    )
+    client = documentai.DocumentProcessorServiceClient(
+        client_options=ClientOptions(
+            api_endpoint=f"{location}-documentai.googleapis.com"
+        )
+    )
+    name = client.processor_version_path(
+        project_id, location, processor_id, processor_version
+    )
+    # Read the file into memory
+    with open(file_path, "rb") as image:
+        image_content = image.read()
+    request = documentai.ProcessRequest(
+        name=name,
+        raw_document=documentai.RawDocument(content=image_content, mime_type=mime_type),
+        # Only supported for Document OCR processor
+        process_options=process_options,
+    )
+    result = client.process_document(request=request)
+    document = result.document
+
+    text = document.text
+    para = []
+    #for converting the chunks
+    def layout_to_text(layout: documentai.Document.Page.Layout, text: str) -> str:
+        """
+        Document AI identifies text in different parts of the document by their
+        offsets in the entirety of the document"s text. This function converts
+        offsets to a string.
+        """
+        # If a text segment spans several lines, it will
+        # be stored in different text segments.
+        return "".join(
+            text[int(segment.start_index) : int(segment.end_index)]
+            for segment in layout.text_anchor.text_segments
+        )
+    for page in document.pages:
+        for p in page.paragraphs:
+            t = layout_to_text(p.layout,text)
+            para.append(t.replace("\n", ""))
+
+    #create a dataframe and store the data
+    d = {"title":text}
+    df = pd.DataFrame.from_dict(d)
+    df["id"] = df.index + 1
+
+    #for embedding generation
+    vertexai.init(project=project_id, location=location)
+    model = TextEmbeddingModel.from_pretrained("textembedding-gecko@001")
+    BATCH_SIZE = 1
+    embs = []
+    def get_embeddings_wrapper(texts):
+        embs = []
+        for i in tqdm.tqdm(range(0, len(texts), BATCH_SIZE)):
+            time.sleep(1)  # to avoid the quota error
+            result = model.get_embeddings(texts[i : i + BATCH_SIZE])
+            embs = embs + [e.values for e in result]
+        return embs
+    df = df.assign(embedding=get_embeddings_wrapper(list(df.title)))
+
+    # returning head of df as response
+    #return df.head()
+    def read_from_gcs():
+        # Initialize the Google Cloud Storage client
+        client = storage.Client()
+        
+        # Define your bucket and file names
+        bucket_name = "test_bucket_pro"
+        file_path = "./2023-annual-report-1-15 (1).pdf"
+        
+        # Get the bucket and blob
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(file_path)
+        
+        # Download the contents of the blob as a string
+        content = blob.download_as_text()
+        
+        # Log the content (or you can process it as needed)
+        print('File content:', content)
+
+    read_from_gcs()
+    return "Successful"
+    
